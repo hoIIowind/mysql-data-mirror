@@ -2,7 +2,7 @@ name: Database Mirror
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # Every 5 minutes
+    - cron: '*/59 * * * *'  # Every 5 minutes
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
