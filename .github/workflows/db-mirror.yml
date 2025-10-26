@@ -44,6 +44,11 @@ jobs:
           echo "## Database Mirror Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
+          inserted=0
+          updated=0
+          deleted=0
+          table_needed=false
+
           while IFS= read -r line
           do
             msg=$(echo "$line" | awk -F' - INFO - ' '{print $2}')
@@ -62,13 +67,20 @@ jobs:
                 inserted=$(echo "$msg" | grep -oP '(\d+) inserted' | grep -oP '\d+')
                 updated=$(echo "$msg" | grep -oP '(\d+) updated' | grep -oP '\d+')
                 deleted=$(echo "$msg" | grep -oP '(\d+) deleted' | grep -oP '\d+')
-                echo "**Sync Results:** Inserted: $inserted | Updated: $updated | Deleted: $deleted" >> $GITHUB_STEP_SUMMARY
+                table_needed=true
                 ;;
               *"Database mirroring completed successfully"*)
                 echo "**Status:** Database mirroring completed successfully" >> $GITHUB_STEP_SUMMARY
                 ;;
-              *)
-                echo "- $msg" >> $GITHUB_STEP_SUMMARY
-                ;;
             esac
           done < db_mirror.log
+
+          # Output table only if sync data was found
+          if [ "$table_needed" = true ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Operation | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Inserted  | $inserted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Updated   | $updated |" >> $GITHUB_STEP_SUMMARY
+            echo "| Deleted   | $deleted |" >> $GITHUB_STEP_SUMMARY
+          fi
