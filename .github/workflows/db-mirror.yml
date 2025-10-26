@@ -1,47 +1,86 @@
 name: Database Mirror
 
 on:
-#  schedule:
-#    - cron: '*/5 * * * *'  # Every 5 minutes
+  #  schedule:
+  #    - cron: '*/5 * * * *'  # Every 5 minutes
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
   mirror-database:
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    
-    - name: Run database mirror
-      env:
-        SOURCE_DB_HOST: ${{ secrets.SOURCE_DB_HOST }}
-        SOURCE_DB_PORT: ${{ secrets.SOURCE_DB_PORT }}
-        SOURCE_DB_USER: ${{ secrets.SOURCE_DB_USER }}
-        SOURCE_DB_PASSWORD: ${{ secrets.SOURCE_DB_PASSWORD }}
-        SOURCE_DB_NAME: ${{ secrets.SOURCE_DB_NAME }}
-        TARGET_DB_HOST: ${{ secrets.TARGET_DB_HOST }}
-        TARGET_DB_PORT: ${{ secrets.TARGET_DB_PORT }}
-        TARGET_DB_USER: ${{ secrets.TARGET_DB_USER }}
-        TARGET_DB_PASSWORD: ${{ secrets.TARGET_DB_PASSWORD }}
-        TARGET_DB_NAME: ${{ secrets.TARGET_DB_NAME }}
-        TABLE_NAME: ${{ secrets.TABLE_NAME }}
-      run: python db_mirror.py
-    
-    - name: Upload logs
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: mirror-logs
-        path: db_mirror.log
-        retention-days: 7
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run database mirror
+        env:
+          SOURCE_DB_HOST: ${{ secrets.SOURCE_DB_HOST }}
+          SOURCE_DB_PORT: ${{ secrets.SOURCE_DB_PORT }}
+          SOURCE_DB_USER: ${{ secrets.SOURCE_DB_USER }}
+          SOURCE_DB_PASSWORD: ${{ secrets.SOURCE_DB_PASSWORD }}
+          SOURCE_DB_NAME: ${{ secrets.SOURCE_DB_NAME }}
+          TARGET_DB_HOST: ${{ secrets.TARGET_DB_HOST }}
+          TARGET_DB_PORT: ${{ secrets.TARGET_DB_PORT }}
+          TARGET_DB_USER: ${{ secrets.TARGET_DB_USER }}
+          TARGET_DB_PASSWORD: ${{ secrets.TARGET_DB_PASSWORD }}
+          TARGET_DB_NAME: ${{ secrets.TARGET_DB_NAME }}
+          TABLE_NAME: ${{ secrets.TABLE_NAME }}
+        run: python db_mirror.py
+
+      - name: Display log in workflow summary
+        if: always()
+        run: |
+          echo "## Database Mirror Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          inserted=0
+          updated=0
+          deleted=0
+          table_needed=false
+
+          while IFS= read -r line
+          do
+            msg=$(echo "$line" | awk -F' - INFO - ' '{print $2}')
+
+            case "$msg" in
+              *"Connected to source database"*)
+                echo "**Source DB:** Connected" >> $GITHUB_STEP_SUMMARY
+                ;;
+              *"Connected to target database"*)
+                echo "**Target DB:** Connected" >> $GITHUB_STEP_SUMMARY
+                ;;
+              *"already exists, skipping creation"*)
+                echo "**Target Table:** Already exists, skipped creation" >> $GITHUB_STEP_SUMMARY
+                ;;
+              *"Synchronization complete:"*)
+                inserted=$(echo "$msg" | grep -oP '(\d+) inserted' | grep -oP '\d+')
+                updated=$(echo "$msg" | grep -oP '(\d+) updated' | grep -oP '\d+')
+                deleted=$(echo "$msg" | grep -oP '(\d+) deleted' | grep -oP '\d+')
+                table_needed=true
+                ;;
+              *"Database mirroring completed successfully"*)
+                echo "**Status:** Database mirroring completed successfully" >> $GITHUB_STEP_SUMMARY
+                ;;
+            esac
+          done < db_mirror.log
+
+          # Output table only if sync data was found
+          if [ "$table_needed" = true ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Operation | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Inserted  | $inserted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Updated   | $updated |" >> $GITHUB_STEP_SUMMARY
+            echo "| Deleted   | $deleted |" >> $GITHUB_STEP_SUMMARY
+          fi
