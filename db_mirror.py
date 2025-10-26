@@ -2,19 +2,17 @@
 import os
 import sys
 import logging
-import hashlib
 import re
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Union
 import mysql.connector
 from mysql.connector import Error
 
-# Load environment variables from .env file for local development
+# Load environment variables from .env if available
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # dotenv not installed, use system environment variables
+    pass
 
 # Configure logging
 logging.basicConfig(
@@ -27,262 +25,216 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+BATCH_SIZE = 500  # rows per batch
+
 class DatabaseMirror:
     def __init__(self):
         self.source_config = {
-            'host': os.getenv('SOURCE_DB_HOST'),
-            'port': int(os.getenv('SOURCE_DB_PORT', 3306)),
-            'user': os.getenv('SOURCE_DB_USER'),
-            'password': os.getenv('SOURCE_DB_PASSWORD'),
-            'database': os.getenv('SOURCE_DB_NAME')
+            "host": os.getenv("SOURCE_DB_HOST"),
+            "port": int(os.getenv("SOURCE_DB_PORT", 3306)),
+            "user": os.getenv("SOURCE_DB_USER"),
+            "password": os.getenv("SOURCE_DB_PASSWORD"),
+            "database": os.getenv("SOURCE_DB_NAME"),
+            "ssl_disabled": False,
+            "connection_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", 10))
         }
-        
+
         self.target_config = {
-            'host': os.getenv('TARGET_DB_HOST'),
-            'port': int(os.getenv('TARGET_DB_PORT', 3306)),
-            'user': os.getenv('TARGET_DB_USER'),
-            'password': os.getenv('TARGET_DB_PASSWORD', ''),
-            'database': os.getenv('TARGET_DB_NAME')
+            "host": os.getenv("TARGET_DB_HOST"),
+            "port": int(os.getenv("TARGET_DB_PORT", 3306)),
+            "user": os.getenv("TARGET_DB_USER"),
+            "password": os.getenv("TARGET_DB_PASSWORD", ""),
+            "database": os.getenv("TARGET_DB_NAME"),
+            "ssl_disabled": False,
+            "connection_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", 10))
         }
-        
-        self.table_name = os.getenv('TABLE_NAME')
-        self.validate_config()
-    
-    def validate_config(self):
-        """Validate all required environment variables are set"""
+
+        self.table_name = os.getenv("TABLE_NAME")
+        self.validate_env()
+
+    def validate_env(self):
         required_vars = [
             'SOURCE_DB_HOST', 'SOURCE_DB_USER', 'SOURCE_DB_PASSWORD', 'SOURCE_DB_NAME',
             'TARGET_DB_HOST', 'TARGET_DB_USER', 'TARGET_DB_NAME', 'TABLE_NAME'
         ]
-        
-        missing_vars = [var for var in required_vars if not os.getenv(var)]
-        
-        # Check if TARGET_DB_PASSWORD exists (can be empty)
-        if os.getenv('TARGET_DB_PASSWORD') is None:
-            missing_vars.append('TARGET_DB_PASSWORD')
-            
-        if missing_vars:
-            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
-    
-    def get_connection(self, config: Dict) -> mysql.connector.MySQLConnection:
-        """Create database connection with retry logic"""
-        try:
-            connection = mysql.connector.connect(**config)
-            if connection.is_connected():
-                return connection
-        except Error as e:
-            logger.error(f"Database connection failed: {e}")
-            raise
-    
-    def get_table_structure(self, connection: mysql.connector.MySQLConnection) -> List[str]:
-        """Get table column names"""
-        cursor = connection.cursor()
-        cursor.execute(f"DESCRIBE {self.table_name}")
-        columns = [row[0] for row in cursor.fetchall()]
-        cursor.close()
-        return columns
-    
-    def create_target_table_if_not_exists(self, source_conn: mysql.connector.MySQLConnection, 
-                                        target_conn: mysql.connector.MySQLConnection):
-        """Create target table with operation_type column if it doesn't exist"""
-        cursor_source = source_conn.cursor()
-        cursor_target = target_conn.cursor()
-        
-        try:
-            # Get source table structure
-            cursor_source.execute(f"SHOW CREATE TABLE `{self.table_name}`")
-            create_statement = cursor_source.fetchone()[1]
+        missing = [var for var in required_vars if not os.getenv(var)]
+        if missing:
+            raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 
-            
-            # Convert double quotes to backticks for MySQL compatibility
-            create_statement = create_statement.replace('"', '`')
-            
-            # Replace table name with IF NOT EXISTS
-            create_statement = create_statement.replace(
-                f"CREATE TABLE `{self.table_name}`",
-                f"CREATE TABLE IF NOT EXISTS `{self.table_name}`"
-            )
-            
-            # Find the position to insert new columns
-            
-            # Find the last column definition and add our columns before the closing parenthesis
-            pattern = r'(.*)(\s*\)\s*(ENGINE.*)?$)'
-            match = re.match(pattern, create_statement, re.DOTALL)
-            
-            if match:
-                before_close = match.group(1)
-                after_close = match.group(2)
-                
-                # Add our columns
-                create_statement = before_close + ",\n  `operation_type` VARCHAR(10) DEFAULT 'inserted',\n  `last_updated` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" + after_close
-            
+    def get_connection(self, to_target: bool = False) -> mysql.connector.MySQLConnection:
+        cfg = self.target_config if to_target else self.source_config
+        retries = 3
+        for i in range(retries):
+            try:
+                conn = mysql.connector.connect(**cfg)
+                if conn.is_connected():
+                    logger.info(f"Connected to {'target' if to_target else 'source'} database")
+                    return conn
+            except Error as e:
+                logger.warning(f"Connection attempt {i+1} failed: {e}")
+        raise ConnectionError(f"Unable to connect to {'target' if to_target else 'source'} database after {retries} attempts")
 
-            cursor_target.execute(create_statement)
-            target_conn.commit()
-            logger.info(f"Target table {self.table_name} created/verified")
-            
-        except Error as e:
-            logger.error(f"Error creating target table: {e}")
-            raise
-        finally:
-            cursor_source.close()
-            cursor_target.close()
-    
-    def get_row_hash(self, row_data: Tuple) -> str:
-        """Generate hash for row data to detect changes"""
-        row_str = '|'.join(str(item) if item is not None else 'NULL' for item in row_data)
-        return hashlib.md5(row_str.encode()).hexdigest()
-    
-    def fetch_source_data(self, connection: mysql.connector.MySQLConnection) -> Dict[str, Tuple]:
-        """Fetch all data from source table with primary key mapping"""
-        cursor = connection.cursor()
-        
-        # Get primary key column
-        cursor.execute(f"""
-            SELECT COLUMN_NAME 
-            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE 
-            WHERE TABLE_SCHEMA = '{self.source_config["database"]}' 
-            AND TABLE_NAME = '{self.table_name}' 
-            AND CONSTRAINT_NAME = 'PRIMARY'
+    def get_primary_keys(self, conn: mysql.connector.MySQLConnection) -> List[str]:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(f"""
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+            WHERE TABLE_SCHEMA = '{conn.database}'
+              AND TABLE_NAME = '{self.table_name}'
+              AND CONSTRAINT_NAME = 'PRIMARY'
             ORDER BY ORDINAL_POSITION
         """)
-        
-        pk_columns = [row[0] for row in cursor.fetchall()]
+        pk_columns = [row['COLUMN_NAME'] for row in cur.fetchall()]
+        cur.close()
         if not pk_columns:
-            raise ValueError(f"No primary key found for table {self.table_name}")
-        
-        # Fetch all data
-        cursor.execute(f"SELECT * FROM {self.table_name}")
-        columns = [desc[0] for desc in cursor.description]
-        
-        data = {}
-        for row in cursor.fetchall():
-            # Create composite key for multiple primary keys
-            pk_values = tuple(row[columns.index(pk)] for pk in pk_columns)
-            pk_key = pk_values[0] if len(pk_values) == 1 else pk_values
-            data[pk_key] = row
-        
-        cursor.close()
-        logger.info(f"Fetched {len(data)} rows from source table")
-        return data, columns, pk_columns
-    
-    def fetch_target_data(self, connection: mysql.connector.MySQLConnection, 
-                         columns: List[str]) -> Dict[str, Tuple]:
-        """Fetch existing data from target table"""
-        cursor = connection.cursor()
-        
-        # Get primary key columns from target
-        cursor.execute(f"""
-            SELECT COLUMN_NAME 
-            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE 
-            WHERE TABLE_SCHEMA = '{self.target_config["database"]}' 
-            AND TABLE_NAME = '{self.table_name}' 
-            AND CONSTRAINT_NAME = 'PRIMARY'
-            ORDER BY ORDINAL_POSITION
-        """)
-        
-        pk_columns = [row[0] for row in cursor.fetchall()]
-        
-        # Select only columns that exist in source (excluding operation_type and last_updated)
-        source_columns = [col for col in columns if col not in ['operation_type', 'last_updated']]
-        columns_str = ', '.join(f"`{col}`" for col in source_columns + pk_columns)
-        
-        cursor.execute(f"SELECT {columns_str} FROM {self.table_name} WHERE operation_type != 'deleted'")
-        
-        data = {}
-        for row in cursor.fetchall():
-            # Create composite key
-            pk_values = tuple(row[len(source_columns) + i] for i in range(len(pk_columns)))
-            pk_key = pk_values[0] if len(pk_values) == 1 else pk_values
-            data[pk_key] = row[:len(source_columns)]  # Only source columns
-        
-        cursor.close()
-        return data, pk_columns
-    
-    def sync_data(self):
-        """Main synchronization logic"""
-        source_conn = None
-        target_conn = None
-        
+            raise ValueError(f"No primary key defined for table {self.table_name}")
+        return pk_columns
+
+    def get_columns(self, conn: mysql.connector.MySQLConnection) -> List[str]:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(f"DESCRIBE {self.table_name}")
+        columns = [row['Field'] for row in cur.fetchall()]
+        cur.close()
+        return columns
+
+    def create_target_table_if_missing(self, src_conn, tgt_conn):
+        tgt_cur = tgt_conn.cursor()
         try:
-            logger.info("Starting database synchronization")
-            
-            # Establish connections
-            source_conn = self.get_connection(self.source_config)
-            target_conn = self.get_connection(self.target_config)
-            
-            # Create target table if needed
-            self.create_target_table_if_not_exists(source_conn, target_conn)
-            
-            # Fetch data
-            source_data, source_columns, pk_columns = self.fetch_source_data(source_conn)
-            target_data, _ = self.fetch_target_data(target_conn, source_columns)
-            
-            cursor = target_conn.cursor()
-            
-            # Track operations
-            inserted_count = 0
-            updated_count = 0
-            deleted_count = 0
-            
-            # Process source data (inserts and updates)
-            for pk_key, source_row in source_data.items():
-                if pk_key not in target_data:
-                    # Insert new row
-                    placeholders = ', '.join(['%s'] * len(source_row))
-                    columns_str = ', '.join(f"`{col}`" for col in source_columns)
-                    
-                    query = f"""
-                        INSERT INTO {self.table_name} ({columns_str}, operation_type) 
-                        VALUES ({placeholders}, 'inserted')
-                    """
-                    cursor.execute(query, source_row)
-                    inserted_count += 1
-                    
-                elif source_row != target_data[pk_key]:
-                    # Update existing row
-                    set_clause = ', '.join(f"`{col}` = %s" for col in source_columns)
-                    where_clause = ' AND '.join(f"`{pk}` = %s" for pk in pk_columns)
-                    
-                    query = f"""
-                        UPDATE {self.table_name} 
-                        SET {set_clause}, operation_type = 'updated', last_updated = CURRENT_TIMESTAMP
-                        WHERE {where_clause}
-                    """
-                    
-                    pk_values = pk_key if isinstance(pk_key, tuple) else (pk_key,)
-                    cursor.execute(query, source_row + pk_values)
-                    updated_count += 1
-            
-            # Mark deleted rows
-            for pk_key in target_data:
-                if pk_key not in source_data:
-                    where_clause = ' AND '.join(f"`{pk}` = %s" for pk in pk_columns)
-                    query = f"""
-                        UPDATE {self.table_name} 
-                        SET operation_type = 'deleted', last_updated = CURRENT_TIMESTAMP
-                        WHERE {where_clause}
-                    """
-                    pk_values = pk_key if isinstance(pk_key, tuple) else (pk_key,)
-                    cursor.execute(query, pk_values)
-                    deleted_count += 1
-            
-            target_conn.commit()
-            cursor.close()
-            
-            logger.info(f"Synchronization completed: {inserted_count} inserted, {updated_count} updated, {deleted_count} deleted")
-            
-        except Exception as e:
-            logger.error(f"Synchronization failed: {e}")
-            if target_conn:
-                target_conn.rollback()
-            raise
-            
+            # Check if table exists
+            tgt_cur.execute(f"SHOW TABLES LIKE '{self.table_name}'")
+            if tgt_cur.fetchone():
+                logger.info(f"Target table {self.table_name} already exists, skipping creation")
+                return
+
+            # Table does not exist, create it
+            src_cur = src_conn.cursor(dictionary=True)
+            src_cur.execute(f"SHOW CREATE TABLE `{self.table_name}`")
+            row = src_cur.fetchone()
+            create_stmt = row['Create Table']
+
+            # Remove FOREIGN KEY constraints
+            create_stmt = re.sub(
+                r',?\s*CONSTRAINT `.*?` FOREIGN KEY .*?\)',
+                '',
+                create_stmt,
+                flags=re.DOTALL
+            )
+
+            # Add operation_type and last_updated columns
+            if 'operation_type' not in create_stmt:
+                create_stmt = create_stmt.rstrip(')') + ",\n  `operation_type` VARCHAR(10) DEFAULT 'inserted',\n  `last_updated` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP\n)"
+
+            tgt_cur.execute("SET FOREIGN_KEY_CHECKS=0;")
+            tgt_cur.execute(create_stmt)
+            tgt_cur.execute("SET FOREIGN_KEY_CHECKS=1;")
+            tgt_conn.commit()
+            logger.info(f"Target table {self.table_name} created successfully")
         finally:
-            if source_conn and source_conn.is_connected():
-                source_conn.close()
-            if target_conn and target_conn.is_connected():
-                target_conn.close()
+            tgt_cur.close()
+            if 'src_cur' in locals():
+                src_cur.close()
+
+
+    def fetch_table_data(self, conn, columns: List[str]) -> Dict[Union[str, Tuple], Tuple]:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(f"SELECT * FROM {self.table_name}")
+        rows = cur.fetchall()
+        cur.close()
+
+        pk_cols = self.get_primary_keys(conn)
+        data = {}
+        for row in rows:
+            pk_vals = tuple(row[pk] for pk in pk_cols)
+            key = pk_vals[0] if len(pk_vals) == 1 else pk_vals
+            data[key] = tuple(row[col] for col in columns)
+        return data
+
+    def sync_data(self):
+        src_conn = tgt_conn = None
+        try:
+            src_conn = self.get_connection(to_target=False)
+            tgt_conn = self.get_connection(to_target=True)
+
+            self.create_target_table_if_missing(src_conn, tgt_conn)
+
+            columns = self.get_columns(src_conn)
+            columns = [c for c in columns if c not in ('operation_type', 'last_updated')]
+
+            src_data = self.fetch_table_data(src_conn, columns)
+            tgt_data = self.fetch_table_data(tgt_conn, columns)
+
+            pk_cols = self.get_primary_keys(src_conn)
+            tgt_cur = tgt_conn.cursor()
+
+            inserted = updated = deleted = 0
+            batch_inserts = []
+            batch_updates = []
+
+            # Disable foreign key checks during all writes
+            tgt_cur.execute("SET FOREIGN_KEY_CHECKS=0;")
+
+            # Inserts / Updates
+            for key, src_row in src_data.items():
+                if key not in tgt_data:
+                    batch_inserts.append(src_row)
+                    if len(batch_inserts) >= BATCH_SIZE:
+                        self._execute_batch_insert(tgt_cur, columns, batch_inserts)
+                        inserted += len(batch_inserts)
+                        batch_inserts.clear()
+                elif src_row != tgt_data[key]:
+                    batch_updates.append((src_row, key))
+                    if len(batch_updates) >= BATCH_SIZE:
+                        cnt = self._execute_batch_update(tgt_cur, columns, pk_cols, batch_updates)
+                        updated += cnt
+                        batch_updates.clear()
+
+            if batch_inserts:
+                self._execute_batch_insert(tgt_cur, columns, batch_inserts)
+                inserted += len(batch_inserts)
+            if batch_updates:
+                cnt = self._execute_batch_update(tgt_cur, columns, pk_cols, batch_updates)
+                updated += cnt
+
+            # Deletes
+            for key in tgt_data:
+                if key not in src_data:
+                    where_clause = " AND ".join(f"`{pk}`=%s" for pk in pk_cols)
+                    tgt_cur.execute(
+                        f"UPDATE {self.table_name} SET operation_type='deleted', last_updated=CURRENT_TIMESTAMP WHERE {where_clause}",
+                        key if isinstance(key, tuple) else (key,)
+                    )
+                    deleted += 1
+
+            tgt_conn.commit()
+
+            # Re-enable foreign key checks
+            tgt_cur.execute("SET FOREIGN_KEY_CHECKS=1;")
+            tgt_cur.close()
+
+            logger.info(f"Synchronization complete: {inserted} inserted, {updated} updated, {deleted} deleted")
+        finally:
+            if src_conn and src_conn.is_connected():
+                src_conn.close()
+            if tgt_conn and tgt_conn.is_connected():
+                tgt_conn.close()
+
+    def _execute_batch_insert(self, cur, columns, batch):
+        placeholders = ','.join(['%s']*len(columns))
+        columns_str = ','.join(f"`{col}`" for col in columns)
+        query = f"INSERT INTO {self.table_name} ({columns_str}, operation_type) VALUES ({placeholders}, 'inserted')"
+        cur.executemany(query, batch)
+
+    def _execute_batch_update(self, cur, columns, pk_cols, batch):
+        count = 0
+        for src_row, key in batch:
+            set_clause = ','.join(f"`{col}`=%s" for col in columns)
+            where_clause = ' AND '.join(f"`{pk}`=%s" for pk in pk_cols)
+            query = f"UPDATE {self.table_name} SET {set_clause}, operation_type='updated', last_updated=CURRENT_TIMESTAMP WHERE {where_clause}"
+            pk_values = key if isinstance(key, tuple) else (key,)
+            cur.execute(query, src_row + pk_values)
+            count += 1
+        return count
+
 
 def main():
     try:
@@ -290,8 +242,9 @@ def main():
         mirror.sync_data()
         logger.info("Database mirroring completed successfully")
     except Exception as e:
-        logger.error(f"Database mirroring failed: {e}")
+        logger.error(f"Mirroring failed: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
