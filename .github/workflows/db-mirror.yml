@@ -41,5 +41,34 @@ jobs:
       - name: Display log in workflow summary
         if: always()
         run: |
-          # Strip timestamp and INFO prefix
-          awk -F' - INFO - ' '{print $2}' db_mirror.log >> $GITHUB_STEP_SUMMARY
+          echo "## Database Mirror Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          while IFS= read -r line
+          do
+            msg=$(echo "$line" | awk -F' - INFO - ' '{print $2}')
+
+            case "$msg" in
+              *"Connected to source database"*)
+                echo "**Source DB:** Connected" >> $GITHUB_STEP_SUMMARY
+                ;;
+              *"Connected to target database"*)
+                echo "**Target DB:** Connected" >> $GITHUB_STEP_SUMMARY
+                ;;
+              *"already exists, skipping creation"*)
+                echo "**Target Table:** Already exists, skipped creation" >> $GITHUB_STEP_SUMMARY
+                ;;
+              *"Synchronization complete:"*)
+                inserted=$(echo "$msg" | grep -oP '(\d+) inserted' | grep -oP '\d+')
+                updated=$(echo "$msg" | grep -oP '(\d+) updated' | grep -oP '\d+')
+                deleted=$(echo "$msg" | grep -oP '(\d+) deleted' | grep -oP '\d+')
+                echo "**Sync Results:** Inserted: $inserted | Updated: $updated | Deleted: $deleted" >> $GITHUB_STEP_SUMMARY
+                ;;
+              *"Database mirroring completed successfully"*)
+                echo "**Status:** Database mirroring completed successfully" >> $GITHUB_STEP_SUMMARY
+                ;;
+              *)
+                echo "- $msg" >> $GITHUB_STEP_SUMMARY
+                ;;
+            esac
+          done < db_mirror.log
