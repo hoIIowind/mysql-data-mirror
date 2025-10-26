@@ -4,6 +4,7 @@ import sys
 import logging
 import re
 from typing import Dict, List, Tuple, Union
+from datetime import datetime, timezone, timedelta
 import mysql.connector
 from mysql.connector import Error
 
@@ -25,7 +26,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 500  # rows per batch
+BATCH_SIZE = 500  # Rows per batch
+
+def ist_now() -> datetime:
+    """Return current IST datetime as timezone-aware object"""
+    utc_now = datetime.now(timezone.utc)          # UTC now, aware
+    ist_offset = timedelta(hours=5, minutes=30)  # IST offset
+    return utc_now + ist_offset
 
 class DatabaseMirror:
     def __init__(self):
@@ -35,8 +42,8 @@ class DatabaseMirror:
             "user": os.getenv("SOURCE_DB_USER"),
             "password": os.getenv("SOURCE_DB_PASSWORD"),
             "database": os.getenv("SOURCE_DB_NAME"),
-            "ssl_disabled": False,
-            "connection_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", 10))
+            "connection_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", 10)),
+            "ssl_disabled": False
         }
 
         self.target_config = {
@@ -45,8 +52,8 @@ class DatabaseMirror:
             "user": os.getenv("TARGET_DB_USER"),
             "password": os.getenv("TARGET_DB_PASSWORD", ""),
             "database": os.getenv("TARGET_DB_NAME"),
-            "ssl_disabled": False,
-            "connection_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", 10))
+            "connection_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", 10)),
+            "ssl_disabled": False
         }
 
         self.table_name = os.getenv("TABLE_NAME")
@@ -100,13 +107,11 @@ class DatabaseMirror:
     def create_target_table_if_missing(self, src_conn, tgt_conn):
         tgt_cur = tgt_conn.cursor()
         try:
-            # Check if table exists
             tgt_cur.execute(f"SHOW TABLES LIKE '{self.table_name}'")
             if tgt_cur.fetchone():
                 logger.info(f"Target table {self.table_name} already exists, skipping creation")
                 return
 
-            # Table does not exist, create it
             src_cur = src_conn.cursor(dictionary=True)
             src_cur.execute(f"SHOW CREATE TABLE `{self.table_name}`")
             row = src_cur.fetchone()
@@ -120,9 +125,17 @@ class DatabaseMirror:
                 flags=re.DOTALL
             )
 
-            # Add operation_type and last_updated columns
+            # Remove existing last_updated column if exists
+            create_stmt = re.sub(
+                r'`last_updated`\s+TIMESTAMP.*?,?',
+                '',
+                create_stmt,
+                flags=re.DOTALL
+            )
+
+            # Add operation_type and last_updated (DATETIME)
             if 'operation_type' not in create_stmt:
-                create_stmt = create_stmt.rstrip(')') + ",\n  `operation_type` VARCHAR(10) DEFAULT 'inserted',\n  `last_updated` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP\n)"
+                create_stmt = create_stmt.rstrip(')') + ",\n  `operation_type` VARCHAR(10) DEFAULT 'inserted',\n  `last_updated` DATETIME DEFAULT CURRENT_TIMESTAMP\n)"
 
             tgt_cur.execute("SET FOREIGN_KEY_CHECKS=0;")
             tgt_cur.execute(create_stmt)
@@ -133,7 +146,6 @@ class DatabaseMirror:
             tgt_cur.close()
             if 'src_cur' in locals():
                 src_cur.close()
-
 
     def fetch_table_data(self, conn, columns: List[str]) -> Dict[Union[str, Tuple], Tuple]:
         cur = conn.cursor(dictionary=True)
@@ -154,6 +166,7 @@ class DatabaseMirror:
         try:
             src_conn = self.get_connection(to_target=False)
             tgt_conn = self.get_connection(to_target=True)
+            tgt_cur = tgt_conn.cursor()
 
             self.create_target_table_if_missing(src_conn, tgt_conn)
 
@@ -162,15 +175,12 @@ class DatabaseMirror:
 
             src_data = self.fetch_table_data(src_conn, columns)
             tgt_data = self.fetch_table_data(tgt_conn, columns)
-
             pk_cols = self.get_primary_keys(src_conn)
-            tgt_cur = tgt_conn.cursor()
 
             inserted = updated = deleted = 0
             batch_inserts = []
             batch_updates = []
 
-            # Disable foreign key checks during all writes
             tgt_cur.execute("SET FOREIGN_KEY_CHECKS=0;")
 
             # Inserts / Updates
@@ -184,30 +194,26 @@ class DatabaseMirror:
                 elif src_row != tgt_data[key]:
                     batch_updates.append((src_row, key))
                     if len(batch_updates) >= BATCH_SIZE:
-                        cnt = self._execute_batch_update(tgt_cur, columns, pk_cols, batch_updates)
-                        updated += cnt
+                        updated += self._execute_batch_update(tgt_cur, columns, pk_cols, batch_updates)
                         batch_updates.clear()
 
             if batch_inserts:
                 self._execute_batch_insert(tgt_cur, columns, batch_inserts)
                 inserted += len(batch_inserts)
             if batch_updates:
-                cnt = self._execute_batch_update(tgt_cur, columns, pk_cols, batch_updates)
-                updated += cnt
+                updated += self._execute_batch_update(tgt_cur, columns, pk_cols, batch_updates)
 
             # Deletes
             for key in tgt_data:
                 if key not in src_data:
                     where_clause = " AND ".join(f"`{pk}`=%s" for pk in pk_cols)
                     tgt_cur.execute(
-                        f"UPDATE {self.table_name} SET operation_type='deleted', last_updated=CURRENT_TIMESTAMP WHERE {where_clause}",
-                        key if isinstance(key, tuple) else (key,)
+                        f"UPDATE {self.table_name} SET operation_type='deleted', last_updated=%s WHERE {where_clause}",
+                        (ist_now(),) + (key if isinstance(key, tuple) else (key,))
                     )
                     deleted += 1
 
             tgt_conn.commit()
-
-            # Re-enable foreign key checks
             tgt_cur.execute("SET FOREIGN_KEY_CHECKS=1;")
             tgt_cur.close()
 
@@ -219,19 +225,18 @@ class DatabaseMirror:
                 tgt_conn.close()
 
     def _execute_batch_insert(self, cur, columns, batch):
-        placeholders = ','.join(['%s']*len(columns))
         columns_str = ','.join(f"`{col}`" for col in columns)
-        query = f"INSERT INTO {self.table_name} ({columns_str}, operation_type) VALUES ({placeholders}, 'inserted')"
-        cur.executemany(query, batch)
+        query = f"INSERT INTO {self.table_name} ({columns_str}, operation_type, last_updated) VALUES ({','.join(['%s']*len(columns))}, 'inserted', %s)"
+        cur.executemany(query, [row + (ist_now(),) for row in batch])
 
     def _execute_batch_update(self, cur, columns, pk_cols, batch):
         count = 0
         for src_row, key in batch:
             set_clause = ','.join(f"`{col}`=%s" for col in columns)
             where_clause = ' AND '.join(f"`{pk}`=%s" for pk in pk_cols)
-            query = f"UPDATE {self.table_name} SET {set_clause}, operation_type='updated', last_updated=CURRENT_TIMESTAMP WHERE {where_clause}"
+            query = f"UPDATE {self.table_name} SET {set_clause}, operation_type='updated', last_updated=%s WHERE {where_clause}"
             pk_values = key if isinstance(key, tuple) else (key,)
-            cur.execute(query, src_row + pk_values)
+            cur.execute(query, src_row + (ist_now(),) + pk_values)
             count += 1
         return count
 
