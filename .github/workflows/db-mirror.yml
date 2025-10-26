@@ -5,7 +5,7 @@ on:
   #    - cron: '*/5 * * * *'  # Every 5 minutes
   workflow_dispatch:  # Allow manual trigger
   repository_dispatch: # Trigger from external web app
-    types: [ mirror_trigger ]
+    types: [ run_data_sync ]
 
 jobs:
   mirror-database:
