@@ -1,47 +1,45 @@
 name: Database Mirror
 
 on:
-#  schedule:
-#    - cron: '*/5 * * * *'  # Every 5 minutes
+  #  schedule:
+  #    - cron: '*/5 * * * *'  # Every 5 minutes
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
   mirror-database:
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    
-    - name: Run database mirror
-      env:
-        SOURCE_DB_HOST: ${{ secrets.SOURCE_DB_HOST }}
-        SOURCE_DB_PORT: ${{ secrets.SOURCE_DB_PORT }}
-        SOURCE_DB_USER: ${{ secrets.SOURCE_DB_USER }}
-        SOURCE_DB_PASSWORD: ${{ secrets.SOURCE_DB_PASSWORD }}
-        SOURCE_DB_NAME: ${{ secrets.SOURCE_DB_NAME }}
-        TARGET_DB_HOST: ${{ secrets.TARGET_DB_HOST }}
-        TARGET_DB_PORT: ${{ secrets.TARGET_DB_PORT }}
-        TARGET_DB_USER: ${{ secrets.TARGET_DB_USER }}
-        TARGET_DB_PASSWORD: ${{ secrets.TARGET_DB_PASSWORD }}
-        TARGET_DB_NAME: ${{ secrets.TARGET_DB_NAME }}
-        TABLE_NAME: ${{ secrets.TABLE_NAME }}
-      run: python db_mirror.py
-    
-    - name: Upload logs
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: mirror-logs
-        path: db_mirror.log
-        retention-days: 7
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run database mirror
+        env:
+          SOURCE_DB_HOST: ${{ secrets.SOURCE_DB_HOST }}
+          SOURCE_DB_PORT: ${{ secrets.SOURCE_DB_PORT }}
+          SOURCE_DB_USER: ${{ secrets.SOURCE_DB_USER }}
+          SOURCE_DB_PASSWORD: ${{ secrets.SOURCE_DB_PASSWORD }}
+          SOURCE_DB_NAME: ${{ secrets.SOURCE_DB_NAME }}
+          TARGET_DB_HOST: ${{ secrets.TARGET_DB_HOST }}
+          TARGET_DB_PORT: ${{ secrets.TARGET_DB_PORT }}
+          TARGET_DB_USER: ${{ secrets.TARGET_DB_USER }}
+          TARGET_DB_PASSWORD: ${{ secrets.TARGET_DB_PASSWORD }}
+          TARGET_DB_NAME: ${{ secrets.TARGET_DB_NAME }}
+          TABLE_NAME: ${{ secrets.TABLE_NAME }}
+        run: python db_mirror.py
+
+      - name: Display log in workflow summary
+        if: always()
+        run: |
+          # Strip timestamp and INFO prefix
+          awk -F' - INFO - ' '{print $2}' db_mirror.log >> $GITHUB_STEP_SUMMARY
